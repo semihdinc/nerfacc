@@ -27,19 +27,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_split",type=str,default="train",choices=["train", "trainval", "None"],help="which train split to use")
     parser.add_argument("--root_dir",type=str,default="/home/ubuntu/ws/data/",help="Root directory of the scenes")
-    parser.add_argument("--scene",type=str,default="lego",help="which scene to use")
+    parser.add_argument("--scene",type=str,default="shuttle8",help="which scene to use")
+    parser.add_argument("--tag",type=str,default="",help="experiment tag name to append on results")
     parser.add_argument("--aabb",type=lambda s: [float(item) for item in s.split(",")],default="-1.5,-1.5,-1.5,1.5,1.5,1.5",help="delimited list input")
     parser.add_argument("--test_chunk_size",type=int,default=8192)
     parser.add_argument("--ev_data",action="store_true",help="whether to use EV dataset or not")
     parser.add_argument("--unbounded",action="store_true",help="whether to use unbounded rendering")
     parser.add_argument("--auto_aabb",action="store_true",help="whether to automatically compute the aabb")
     parser.add_argument("--cone_angle", type=float, default=0.0)
-    parser.add_argument("--i_test",type=int,default=5000,help="Iterations to start validation test")
+    parser.add_argument("--i_test",type=int,default=1000,help="Iterations to start validation test")
     parser.add_argument("--i_ckpt",type=int,default=1000,help="Iterations to save model")
     parser.add_argument("--ckpt_path",type=str,default="",help="Model ckpt path to save/load")
     parser.add_argument("--render_n_samples",type=int,default=1024,help="Number of samples per render")
     parser.add_argument("--max_steps",type=int,default=30000,help="Number of iterations")
     parser.add_argument("--save_test_img",action="store_true",help="whether to save test images")
+    parser.add_argument("--render_only",action="store_true",help="whether to only render images")
     args = parser.parse_args()
 
     render_n_samples = args.render_n_samples
@@ -88,7 +90,7 @@ if __name__ == "__main__":
     test_poses.camtoworlds = test_poses.camtoworlds.to(device)
     test_poses.K = test_poses.K.to(device)
 
-    savepath = os.path.join(data_root_fp,args.scene+"_test")
+    savepath = os.path.join(data_root_fp,f"results/{args.scene}{'_'+args.tag if args.tag != '' else args.tag}")
     if not os.path.exists(savepath):
         os.makedirs(savepath)
         print('Test results folder not found, creating new dir: ' + savepath)
@@ -138,8 +140,8 @@ if __name__ == "__main__":
     writer = SummaryWriter(savepath)
     print(f'Tensorboard cmd: tensorboard --logdir {savepath}')
 
-    # training
     step = 0
+    # Load checkpoints
     load_ckpt = sorted(glob.glob(f'{args.ckpt_path}/*.ckpt'))
     if args.ckpt_path != "" and load_ckpt != []: 
         load_ckpt = load_ckpt[-1]
@@ -151,8 +153,9 @@ if __name__ == "__main__":
         scheduler.load_state_dict(model['scheduler_state_dict']) # not critical
         occupancy_grid.load_state_dict(model['occupancy_grid_state_dict'])
         print(f"Loaded checkpoint from: {load_ckpt}")
-        print(f"Previous Loss: mse={model['mse']:.5f} psnr={model['psnr']:.2f}")
-
+        print(f"Previous Training Loss: mse={model['mse']:.5f} psnr={model['psnr']:.2f}")
+    
+    # training
     tic = time.time()
     for epoch in range(10000000):
         for i in range(len(train_dataset)):
@@ -237,8 +240,9 @@ if __name__ == "__main__":
                     f"n_renders={n_rendering_samples:d} | n_rays={len(pixels):d} |"
                 )
 
-            if step >= 0 and step % args.i_test == 0 and step > 0:
+            if step >= 0 and (step % args.i_test == 0 or args.render_only) and step > 0 :
                 # evaluation
+                if args.render_only: print("Only render images")
                 radiance_field.eval()
 
                 v_psnrs, v_mses = [], []
@@ -289,7 +293,7 @@ if __name__ == "__main__":
                 writer.add_scalar("mse/val", v_mse_avg, step)
                 train_dataset.training = True
 
-            if step >= 0 and step % args.i_ckpt == 0 and step > 0:
+            if step >= 0 and step % args.i_ckpt == 0 and step > 0 and not args.render_only:
                 # Save checkpoint
                 ckpt_flag = True # Save flag
                 args.ckpt_path = os.path.join(savepath, "ckpts") if args.ckpt_path == "" else args.ckpt_path
@@ -317,9 +321,9 @@ if __name__ == "__main__":
                     # grad_scaler <1MB, radiance_field ~48MB, optimizer ~96MB, scheduler <1MB, occupancy_grid ~592MB
                     print(f'Checkpoint save in: {ckpt_path}, {os.path.getsize(ckpt_path)/1024/1024:.2f}MB')
 
-            if step == max_steps:
+            if step == max_steps or args.render_only:
                 # End of training
-                print("training stops")
+                print("End of rendering") if args.render_only else print("End of training") 
                 writer.flush()
                 writer.close()
                 exit()
