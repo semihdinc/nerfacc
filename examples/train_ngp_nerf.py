@@ -39,6 +39,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_path",type=str,default="",help="Model ckpt path to save/load")
     parser.add_argument("--render_n_samples",type=int,default=1024,help="Number of samples per render")
     parser.add_argument("--max_steps",type=int,default=30000,help="Number of iterations")
+    parser.add_argument("--save_test_img",action="store_true",help="whether to save test images")
     args = parser.parse_args()
 
     render_n_samples = args.render_n_samples
@@ -139,10 +140,18 @@ if __name__ == "__main__":
 
     # training
     step = 0
-    if args.ckpt_path != "": 
-        load_ckpt = sorted(glob.glob(f'{args.ckpt_path}/*.ckpt'))[-1]
-        torch.load(load_ckpt)
-        print(f'Loaded checkpoint from: {load_ckpt}')
+    load_ckpt = sorted(glob.glob(f'{args.ckpt_path}/*.ckpt'))
+    if args.ckpt_path != "" and load_ckpt != []: 
+        load_ckpt = load_ckpt[-1]
+        model = torch.load(load_ckpt)
+        step = model['step']+1
+        grad_scaler.load_state_dict(model['grad_scaler_state_dict']) # not critical
+        radiance_field.load_state_dict(model['radiance_field_state_dict'])
+        optimizer.load_state_dict(model['optimizer_state_dict'])
+        scheduler.load_state_dict(model['scheduler_state_dict']) # not critical
+        occupancy_grid.load_state_dict(model['occupancy_grid_state_dict'])
+        print(f"Loaded checkpoint from: {load_ckpt}")
+        print(f"Previous Loss: mse={model['mse']:.5f} psnr={model['psnr']:.2f}")
 
     tic = time.time()
     for epoch in range(10000000):
@@ -232,7 +241,7 @@ if __name__ == "__main__":
                 # evaluation
                 radiance_field.eval()
 
-                psnrs, mses = [], []
+                v_psnrs, v_mses = [], []
                 with torch.no_grad():
                     for i in tqdm.tqdm(range(10)):
                         data = test_dataset[i]
@@ -257,24 +266,27 @@ if __name__ == "__main__":
                             # test options
                             test_chunk_size=args.test_chunk_size,
                         )
-                        mse = F.mse_loss(rgb, pixels)
-                        mses.append(mse)
-                        psnr = -10.0 * torch.log(mse) / np.log(10.0)
-                        psnrs.append(psnr.item())
-                        writer.add_image(f'rgb{i}', rgb, step, dataformats='HWC')
+                        v_mse = F.mse_loss(rgb, pixels)
+                        v_mses.append(v_mse)
+                        v_psnr = -10.0 * torch.log(v_mse) / np.log(10.0)
+                        v_psnrs.append(v_psnr.item())
+                        _rgb = (rgb.cpu().numpy() * 255).astype(np.uint8)
+                        writer.add_image(f'rgb{i}', _rgb, step, dataformats='HWC')
                         depth -= depth.min()
                         depth /= depth.max()
-                        writer.add_image(f'depth{i}', depth, step, dataformats='HWC')
-                        
-                        # saveImg = os.path.join(savepath,"rgb_test_"+str(i)+".png")
-                        # imageio.imwrite(saveImg,(rgb.cpu().numpy() * 255).astype(np.uint8))
-                        # imageio.imwrite("/home/ubuntu/data/depth_test_"+str(i)+".png",(depth.cpu().numpy() * 255).astype(np.uint8))
+                        _depth = (depth.cpu().numpy() * 255).astype(np.uint8)
+                        writer.add_image(f'depth{i}', _depth, step, dataformats='HWC')
+                        if args.save_test_img:
+                            os.makedirs(f"{savepath}/eval_img/", exist_ok=True)
+                            imageio.imwrite(os.path.join(savepath,"eval_img/rgb_"+str(i)+".png"), _rgb)
+                            imageio.imwrite(os.path.join(savepath,"eval_img/depth_"+str(i)+".png"), _depth)
+
                 # Write to tensorboard
-                mse_avg = sum(mses) / len(mses)
-                psnr_avg = sum(psnrs) / len(psnrs)
-                print(f"evaluation: mse_avg={mse_avg:.5f} | psnr_avg={psnr_avg:.3f}")
-                writer.add_scalar("psnr/val", psnr_avg, step)
-                writer.add_scalar("mse/val", mse_avg, step)
+                v_mse_avg = sum(v_mses) / len(v_mses)
+                v_psnr_avg = sum(v_psnrs) / len(v_psnrs)
+                print(f"evaluation: mse_avg={v_mse_avg:.5f} | psnr_avg={v_psnr_avg:.3f}")
+                writer.add_scalar("psnr/val", v_psnr_avg, step)
+                writer.add_scalar("mse/val", v_mse_avg, step)
                 train_dataset.training = True
 
             if step >= 0 and step % args.i_ckpt == 0 and step > 0:
@@ -299,14 +311,17 @@ if __name__ == "__main__":
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'scheduler_state_dict': scheduler.state_dict(),
                                 'occupancy_grid_state_dict': occupancy_grid.state_dict(),
-                                'loss': loss
+                                'mse': mse,
+                                'psnr': psnr
                                 }, ckpt_path)
-                    print(f'Checkpoint save in: {ckpt_path}')
+                    # grad_scaler <1MB, radiance_field ~48MB, optimizer ~96MB, scheduler <1MB, occupancy_grid ~592MB
+                    print(f'Checkpoint save in: {ckpt_path}, {os.path.getsize(ckpt_path)/1024/1024:.2f}MB')
 
             if step == max_steps:
                 # End of training
                 print("training stops")
                 writer.flush()
+                writer.close()
                 exit()
 
             step += 1
