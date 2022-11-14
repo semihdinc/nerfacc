@@ -6,6 +6,7 @@ import argparse
 import math
 import os
 import time
+import glob
 
 import imageio
 import numpy as np
@@ -14,6 +15,7 @@ import torch.nn.functional as F
 import tqdm
 from radiance_fields.ngp import NGPradianceField
 from utils import render_image, set_random_seed
+from torch.utils.tensorboard import SummaryWriter
 
 from nerfacc import ContractionType, OccupancyGrid
 
@@ -23,7 +25,8 @@ if __name__ == "__main__":
     set_random_seed(42)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_split",type=str,default="trainval",choices=["train", "trainval", "None"],help="which train split to use")
+    parser.add_argument("--train_split",type=str,default="train",choices=["train", "trainval", "None"],help="which train split to use")
+    parser.add_argument("--root_dir",type=str,default="/home/ubuntu/ws/data/",help="Root directory of the scenes")
     parser.add_argument("--scene",type=str,default="lego",help="which scene to use")
     parser.add_argument("--aabb",type=lambda s: [float(item) for item in s.split(",")],default="-1.5,-1.5,-1.5,1.5,1.5,1.5",help="delimited list input")
     parser.add_argument("--test_chunk_size",type=int,default=8192)
@@ -31,10 +34,14 @@ if __name__ == "__main__":
     parser.add_argument("--unbounded",action="store_true",help="whether to use unbounded rendering")
     parser.add_argument("--auto_aabb",action="store_true",help="whether to automatically compute the aabb")
     parser.add_argument("--cone_angle", type=float, default=0.0)
-    parser.add_argument("--i_test",type=int, default=5000)
+    parser.add_argument("--i_test",type=int,default=5000,help="Iterations to start validation test")
+    parser.add_argument("--i_ckpt",type=int,default=1000,help="Iterations to save model")
+    parser.add_argument("--ckpt_path",type=str,default="",help="Model ckpt path to save/load")
+    parser.add_argument("--render_n_samples",type=int,default=1024,help="Number of samples per render")
+    parser.add_argument("--max_steps",type=int,default=30000,help="Number of iterations")
     args = parser.parse_args()
 
-    render_n_samples = 1024
+    render_n_samples = args.render_n_samples
 
     # setup the dataset
     train_dataset_kwargs = {}
@@ -43,14 +50,14 @@ if __name__ == "__main__":
     if args.ev_data == True:
         from datasets.nerf_synthetic import SubjectLoader
         from datasets.generateTestPoses import SubjectTestPoseLoader
-        data_root_fp = "/home/ubuntu/data/"
+        data_root_fp = args.root_dir
         train_dataset_kwargs = {"color_bkgd_aug": "random"}
         target_sample_batch_size = 1 << 20
         grid_resolution = 256
 
     elif args.unbounded:
         from datasets.nerf_360_v2 import SubjectLoader
-        data_root_fp = "/home/ubuntu/data/360_v2/"
+        data_root_fp = args.root_dir
         target_sample_batch_size = 1 << 20
         train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 4}
         test_dataset_kwargs = {"factor": 4}
@@ -58,7 +65,7 @@ if __name__ == "__main__":
 
     else:
         from datasets.nerf_synthetic import SubjectLoader
-        data_root_fp = "/home/ubuntu/data/nerf_synthetic/"
+        data_root_fp = args.root_dir
         target_sample_batch_size = 1 << 18
         grid_resolution = 128
 
@@ -116,11 +123,10 @@ if __name__ == "__main__":
     print("Using aabb", args.aabb, render_step_size)
 
     # setup the radiance field we want to train.
-    max_steps = 30000
+    max_steps = args.max_steps
     grad_scaler = torch.cuda.amp.GradScaler(2**10)
     radiance_field = NGPradianceField(aabb=args.aabb,unbounded=args.unbounded,).to(device)
     optimizer = torch.optim.Adam(radiance_field.parameters(), lr=1e-2, eps=1e-15)
-    
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer,
         milestones=[max_steps // 2, max_steps * 3 // 4, max_steps * 9 // 10],
@@ -128,9 +134,16 @@ if __name__ == "__main__":
     )
 
     occupancy_grid = OccupancyGrid(roi_aabb=args.aabb,resolution=grid_resolution,contraction_type=contraction_type).to(device)
+    writer = SummaryWriter(savepath)
+    print(f'Tensorboard cmd: tensorboard --logdir {savepath}')
 
     # training
     step = 0
+    if args.ckpt_path != "": 
+        load_ckpt = sorted(glob.glob(f'{args.ckpt_path}/*.ckpt'))[-1]
+        torch.load(load_ckpt)
+        print(f'Loaded checkpoint from: {load_ckpt}')
+
     tic = time.time()
     for epoch in range(10000000):
         for i in range(len(train_dataset)):
@@ -204,26 +217,29 @@ if __name__ == "__main__":
 
             if step % 100 == 0:
                 elapsed_time = time.time() - tic
-                loss = F.mse_loss(rgb[alive_ray_mask], pixels[alive_ray_mask])
+                mse = F.mse_loss(rgb[alive_ray_mask], pixels[alive_ray_mask])
+                psnr = -10.0 * torch.log(mse) / np.log(10.0)
+                writer.add_scalar("mse/train", mse, step)
+                writer.add_scalar("psnr/train", psnr, step)
                 print(
                     f"elapsed_time={elapsed_time:.2f}s | step={step} | "
-                    f"loss={loss:.5f} | "
-                    f"alive_ray_mask={alive_ray_mask.long().sum():d} | "
-                    f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} |"
+                    f"loss={mse:.5f} ({psnr:.2f})| "
+                    f"alive_ray={alive_ray_mask.long().sum():d} | "
+                    f"n_renders={n_rendering_samples:d} | n_rays={len(pixels):d} |"
                 )
 
             if step >= 0 and step % args.i_test == 0 and step > 0:
                 # evaluation
                 radiance_field.eval()
 
-                psnrs = []
+                psnrs, mses = [], []
                 with torch.no_grad():
                     for i in tqdm.tqdm(range(10)):
                         data = test_dataset[i]
                         # data = test_poses[i]
                         render_bkgd = data["color_bkgd"]
                         rays = data["rays"]
-                        # pixels = data["pixels"]
+                        pixels = data["pixels"]
 
                         # rendering
                         rgb, acc, depth, _ = render_image(
@@ -241,19 +257,56 @@ if __name__ == "__main__":
                             # test options
                             test_chunk_size=args.test_chunk_size,
                         )
-                        # mse = F.mse_loss(rgb, pixels)
-                        # psnr = -10.0 * torch.log(mse) / np.log(10.0)
-                        # psnrs.append(psnr.item())
-                        saveImg = os.path.join(savepath,"rgb_test_"+str(i)+".png")
-                        imageio.imwrite(saveImg,(rgb.cpu().numpy() * 255).astype(np.uint8))
+                        mse = F.mse_loss(rgb, pixels)
+                        mses.append(mse)
+                        psnr = -10.0 * torch.log(mse) / np.log(10.0)
+                        psnrs.append(psnr.item())
+                        writer.add_image(f'rgb{i}', rgb, step, dataformats='HWC')
+                        depth -= depth.min()
+                        depth /= depth.max()
+                        writer.add_image(f'depth{i}', depth, step, dataformats='HWC')
+                        
+                        # saveImg = os.path.join(savepath,"rgb_test_"+str(i)+".png")
+                        # imageio.imwrite(saveImg,(rgb.cpu().numpy() * 255).astype(np.uint8))
                         # imageio.imwrite("/home/ubuntu/data/depth_test_"+str(i)+".png",(depth.cpu().numpy() * 255).astype(np.uint8))
-
-                # psnr_avg = sum(psnrs) / len(psnrs)
-                # print(f"evaluation: psnr_avg={psnr_avg}")
+                # Write to tensorboard
+                mse_avg = sum(mses) / len(mses)
+                psnr_avg = sum(psnrs) / len(psnrs)
+                print(f"evaluation: mse_avg={mse_avg:.5f} | psnr_avg={psnr_avg:.3f}")
+                writer.add_scalar("psnr/val", psnr_avg, step)
+                writer.add_scalar("mse/val", mse_avg, step)
                 train_dataset.training = True
 
+            if step >= 0 and step % args.i_ckpt == 0 and step > 0:
+                # Save checkpoint
+                ckpt_flag = True # Save flag
+                args.ckpt_path = os.path.join(savepath, "ckpts") if args.ckpt_path == "" else args.ckpt_path
+                os.makedirs(args.ckpt_path, exist_ok=True)
+                ckpt_path = os.path.join(args.ckpt_path, f'model_{step}.ckpt')
+                for ckpt in sorted(glob.glob(f'{args.ckpt_path}/*.ckpt')):
+                    if int(os.path.basename(ckpt)[6:-5]) <= step or ckpt == []:
+                        os.remove(ckpt)
+                    else:
+                        print(f'Higher checkpoint is found at: {ckpt}')
+                        print('Skip saving checkpoint')
+                        ckpt_flag = False
+
+                if ckpt_flag:
+                    torch.save({
+                                'step': step,
+                                'grad_scaler_state_dict': grad_scaler.state_dict(),
+                                'radiance_field_state_dict': radiance_field.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'scheduler_state_dict': scheduler.state_dict(),
+                                'occupancy_grid_state_dict': occupancy_grid.state_dict(),
+                                'loss': loss
+                                }, ckpt_path)
+                    print(f'Checkpoint save in: {ckpt_path}')
+
             if step == max_steps:
+                # End of training
                 print("training stops")
+                writer.flush()
                 exit()
 
             step += 1
