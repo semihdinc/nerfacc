@@ -25,23 +25,30 @@ if __name__ == "__main__":
     set_random_seed(42)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_split",type=str,default="train",choices=["train", "trainval", "None"],help="which train split to use")
+    # File handling and data loading
+    parser.add_argument("--train_split",type=str,default="None",choices=["train", "trainval", "None"],help="which train split to use")
     parser.add_argument("--root_dir",type=str,default="/home/ubuntu/ws/data/",help="Root directory of the scenes")
     parser.add_argument("--scene",type=str,default="shuttle8",help="which scene to use")
     parser.add_argument("--tag",type=str,default="",help="experiment tag name to append on results")
-    parser.add_argument("--aabb",type=lambda s: [float(item) for item in s.split(",")],default="-1.5,-1.5,-1.5,1.5,1.5,1.5",help="delimited list input")
-    parser.add_argument("--test_chunk_size",type=int,default=8192)
     parser.add_argument("--ev_data",action="store_true",help="whether to use EV dataset or not")
+    parser.add_argument("--ckpt_path",type=str,default="",help="Model ckpt path to save/load")
+
+    # Training params
+    parser.add_argument("--aabb",type=lambda s: [float(item) for item in s.split(",")],default="-1.5,-1.5,-1.5,1.5,1.5,1.5",help="aabb delimited list input")
+    parser.add_argument("--test_chunk_size",type=int,default=8192)
     parser.add_argument("--unbounded",action="store_true",help="whether to use unbounded rendering")
     parser.add_argument("--auto_aabb",action="store_true",help="whether to automatically compute the aabb")
     parser.add_argument("--cone_angle", type=float, default=0.0)
+    parser.add_argument("--max_steps",type=int,default=30000,help="Number of training iterations")
+    
+    # Rendering and testing/validation
     parser.add_argument("--i_test",type=int,default=1000,help="Iterations to start validation test")
     parser.add_argument("--i_ckpt",type=int,default=1000,help="Iterations to save model")
-    parser.add_argument("--ckpt_path",type=str,default="",help="Model ckpt path to save/load")
     parser.add_argument("--render_n_samples",type=int,default=1024,help="Number of samples per render")
-    parser.add_argument("--max_steps",type=int,default=30000,help="Number of iterations")
     parser.add_argument("--save_test_img",action="store_true",help="whether to save test images")
     parser.add_argument("--render_only",action="store_true",help="whether to only render images")
+    parser.add_argument("--test_index",type=lambda st: [int(item) for item in st.split(",")],default="",help="Indicies to test, delimited list input")
+
     args = parser.parse_args()
 
     render_n_samples = args.render_n_samples
@@ -116,7 +123,7 @@ if __name__ == "__main__":
     else:
         contraction_type = ContractionType.AABB
         # args.aabb = [-1.5, -1.5, -1.5, 1.5, 1.5, 1.5]
-        args.aabb = [-1500, -1500, -50, 1500, 1500, 250]
+        # args.aabb = [-1500, -1500, -50, 1500, 1500, 250]
         scene_aabb = torch.tensor(args.aabb, dtype=torch.float32, device=device)
         near_plane = None
         far_plane = None
@@ -142,6 +149,7 @@ if __name__ == "__main__":
 
     step = 0
     # Load checkpoints
+    args.ckpt_path = os.path.join(savepath, "ckpts") if args.ckpt_path == "" else args.ckpt_path
     load_ckpt = sorted(glob.glob(f'{args.ckpt_path}/*.ckpt'))
     if args.ckpt_path != "" and load_ckpt != []: 
         load_ckpt = load_ckpt[-1]
@@ -243,11 +251,15 @@ if __name__ == "__main__":
             if step >= 0 and (step % args.i_test == 0 or args.render_only) and step > 0 :
                 # evaluation
                 if args.render_only: print("Only render images")
+                if args.test_index == []:
+                    args.test_index = range(len(test_dataset))
+                
+                print(f"testing index: {args.test_index}")
                 radiance_field.eval()
 
                 v_psnrs, v_mses = [], []
                 with torch.no_grad():
-                    for i in tqdm.tqdm(range(10)):
+                    for i in tqdm.tqdm(args.test_index):
                         data = test_dataset[i]
                         # data = test_poses[i]
                         render_bkgd = data["color_bkgd"]
@@ -296,7 +308,6 @@ if __name__ == "__main__":
             if step >= 0 and step % args.i_ckpt == 0 and step > 0 and not args.render_only:
                 # Save checkpoint
                 ckpt_flag = True # Save flag
-                args.ckpt_path = os.path.join(savepath, "ckpts") if args.ckpt_path == "" else args.ckpt_path
                 os.makedirs(args.ckpt_path, exist_ok=True)
                 ckpt_path = os.path.join(args.ckpt_path, f'model_{step}.ckpt')
                 for ckpt in sorted(glob.glob(f'{args.ckpt_path}/*.ckpt')):

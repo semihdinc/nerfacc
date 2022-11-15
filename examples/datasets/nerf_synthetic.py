@@ -62,8 +62,8 @@ class SubjectLoader(torch.utils.data.Dataset):
     NEAR, FAR = 2.0, 6.0
     OPENGL_CAMERA = True
 
-    def __init__(   self,subject_id: str,root_fp: str,split: str,color_bkgd_aug: str = "white",
-                    num_rays: int = None,near: float = None,far: float = None,batch_over_images: bool = True):
+    def __init__(   self, subject_id: str, root_fp: str, split: str, color_bkgd_aug: str = "white",
+                    num_rays: int = None, near: float = None, far: float = None, batch_over_images: bool = True):
 
         super().__init__()
         assert split in self.SPLITS, "%s" % split
