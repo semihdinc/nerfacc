@@ -5,6 +5,7 @@ Copyright (c) 2022 Ruilong Li, UC Berkeley.
 import collections
 
 Rays = collections.namedtuple("Rays", ("origins", "viewdirs"))
+depth_Rays = collections.namedtuple("Rays", ("origins", "viewdirs", "depths", "weights"))
 
 
 def namedtuple_map(fn, tup):

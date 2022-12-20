@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from read_write_model import *
 
-from .utils import Rays
+from .utils import Rays, depth_Rays
 def rotmat(a, b):
 	a, b = a / np.linalg.norm(a), b / np.linalg.norm(b)
 	v = np.cross(a, b)
@@ -174,6 +174,29 @@ def get_depth_rays(H, W, focal, poses, depth_gts):
     print('done')
     i_batch = 0
 
+def getRays(img, x, y, K, c2w, OPENGL_CAMERA=True):
+    rgba = img[x, y] / 255.0   # (num_rays, 4)
+
+    camera_dirs = F.pad(
+        torch.stack(
+            [
+                (y - K[0, 2] + 0.5) / K[0, 0],
+                (x - K[1, 2] + 0.5) / K[1, 1] * (-1.0 if OPENGL_CAMERA else 1.0),
+            ],
+            dim=-1,
+        ),
+        (0, 1),
+        value=(-1.0 if OPENGL_CAMERA else 1.0),
+    )  # [num_rays, 3]
+    
+    # [n_cams, height, width, 3]
+    directions = (camera_dirs[:, None, :] * c2w[:3, :3]).sum(dim=-1)
+    ray_o = torch.broadcast_to(c2w[:3, -1], directions.shape)
+    ray_d = directions / torch.linalg.norm(
+        directions, dim=-1, keepdims=True
+    )
+    return ray_o, ray_d, rgba
+
 class SubjectLoader(torch.utils.data.Dataset):
     """Single subject data loader for training and evaluation."""
 
@@ -233,11 +256,20 @@ class SubjectLoader(torch.utils.data.Dataset):
         else:
             pixels = rgba
 
+        dep_rgba, dep_rays = data["depth_rgba"], data["depth_rays"]
+        if dep_rgba.shape[-1] == 4:
+            dep_pixels, alpha = torch.split(dep_rgba, [3, 1], dim=-1)
+            dep_pixels = dep_pixels * alpha + color_bkgd * (1.0 - alpha)
+        else:
+            dep_pixels = dep_rgba
+
         return {
             "pixels": pixels,  # [n_rays, 3] or [h, w, 3]
             "rays": rays,  # [n_rays,] or [h, w]
+            "depth_pixels": dep_pixels,  # [n_rays, 3] or [h, w, 3]
+            "depth_rays": dep_rays,  # [n_rays,] or [h, w]
             "color_bkgd": color_bkgd,  # [3,]
-            **{k: v for k, v in data.items() if k not in ["rgba", "rays"]},
+            **{k: v for k, v in data.items() if k not in ["rgba", "rays", "depth_rgba", "depth_rays"]},
         }
 
     def update_num_rays(self, num_rays):
@@ -249,77 +281,76 @@ class SubjectLoader(torch.utils.data.Dataset):
 
         if self.training:
             
-            all_origins = []
-            all_viewdirs = []
-            all_rgba = []
-            all_depth = []
-            all_weight = []
+            rgba_ray_o = []
+            rgba_ray_d = []
+            rgba_rgba = []
+            dep_ray_o = []
+            dep_ray_d = []
+            dep_rgba = []
+            dep_depth = []
+            dep_weight = []
+            depth_prop = 0.5
             N = len(self.images)
             tot_pts = sum(self.depth_gts['size'])
             pts_used = 0
             for i in range(N):
                 img = torch.from_numpy(self.images[i]).to(torch.uint8).to(device=self.camtoworlds.device)
+                
+                # Get rgba rays
                 H, W, _ = img.shape
+                num_color_rays = int(np.round(num_rays*(1-depth_prop)))
                 if i == N-1:
-                    pts_to_use = num_rays - pts_used
+                    rgba_batch = num_color_rays-torch.cat(rgba_rgba,0).shape[0]
+                else: 
+                    rgba_batch = num_color_rays//N
+
+                xc = torch.randint(0, H, size=(rgba_batch,), device=self.camtoworlds.device)
+                yc = torch.randint(0, W, size=(rgba_batch,), device=self.camtoworlds.device)
+                c2w = self.camtoworlds[i]  # (num_rays, 3, 4)
+                ray_o, ray_d, rgba = getRays(img, xc, yc, self.K[i], c2w)
+                rgba_ray_o.append(ray_o)
+                rgba_ray_d.append(ray_d)
+                rgba_rgba.append(rgba)
+                
+                # Get depth rays
+                num_dep_rays = num_rays-num_color_rays
+
+                if i == N-1:
+                    pts_to_use = num_dep_rays - pts_used
                 else:
-                    pts_to_use = int(round(self.depth_gts['size'][i]/tot_pts*num_rays, 0))
+                    pts_to_use = int(round(self.depth_gts['size'][i]/tot_pts*num_dep_rays, 0))
 
                 pts_used += pts_to_use
                 pts_i = torch.randint(0, self.depth_gts['size'][i]-1, size=(pts_to_use,))
                 xy = torch.from_numpy(np.round(self.depth_gts['coord'][i][pts_i])).to(torch.long).to(device=self.camtoworlds.device)
                 y = xy[:, 0]
                 x = xy[:, 1]
-                #x = torch.randint(0, H, size=(num_rays//N,), device=self.camtoworlds.device)
-                #y = torch.randint(0, W, size=(num_rays//N,), device=self.camtoworlds.device)
-
+                
                 depth = torch.from_numpy(self.depth_gts['depth'][i][pts_i]).to(torch.float).to(device=self.camtoworlds.device)
                 weight = torch.from_numpy(self.depth_gts['weight'][i][pts_i]).to(torch.float).to(device=self.camtoworlds.device)
-                '''depth_value = np.repeat(depth_gts[i]['depth'][:,None,None], 3, axis=2) # N x 1 x 3
-                weights = np.repeat(depth_gts[i]['weight'][:,None,None], 3, axis=2) # N x 1 x 3
-                rays_depth = np.concatenate([rays_depth, depth_value, weights], axis=1) # N x 4 x 3
-                rays_depth_list.append(rays_depth)'''
 
-                rgba = img[x, y] / 255.0   # (num_rays, 4)
-                c2w = self.camtoworlds[i]  # (num_rays, 3, 4)
-        
-                K = self.K[i]
-                camera_dirs = F.pad(
-                    torch.stack(
-                        [
-                            (y - K[0, 2] + 0.5) / K[0, 0],
-                            (x - K[1, 2] + 0.5) / K[1, 1] * (-1.0 if self.OPENGL_CAMERA else 1.0),
-                        ],
-                        dim=-1,
-                    ),
-                    (0, 1),
-                    value=(-1.0 if self.OPENGL_CAMERA else 1.0),
-                )  # [num_rays, 3]
-                
-                # [n_cams, height, width, 3]
-                directions = (camera_dirs[:, None, :] * c2w[:3, :3]).sum(dim=-1)
-                origins = torch.broadcast_to(c2w[:3, -1], directions.shape)
-                viewdirs = directions / torch.linalg.norm(
-                    directions, dim=-1, keepdims=True
-                )
+                ray_o, ray_d, rgba = getRays(img, x, y, self.K[i], c2w)
+                dep_ray_o.append(ray_o)
+                dep_ray_d.append(ray_d)
+                dep_rgba.append(rgba)
+                dep_depth.append(depth)
+                dep_weight.append(weight)
 
-                all_origins.append(origins)
-                all_viewdirs.append(viewdirs)
-                all_rgba.append(rgba)
-                all_depth.append(depth)
-                all_weight.append(weight)
+        rgba_ray_o = torch.cat(rgba_ray_o,0)
+        rgba_ray_d = torch.cat(rgba_ray_d,0)
+        rgba_rgba = torch.cat(rgba_rgba,0)
+        dep_ray_o = torch.cat(dep_ray_o,0)
+        dep_ray_d = torch.cat(dep_ray_d,0)
+        dep_rgba = torch.cat(dep_rgba,0)
+        dep_depth = torch.cat(dep_depth,0)
+        dep_weight = torch.cat(dep_weight,0)
 
-        all_origins = torch.cat(all_origins,0)
-        all_viewdirs = torch.cat(all_viewdirs,0)
-        all_rgba = torch.cat(all_rgba,0)
-        all_depth = torch.cat(all_depth,0)
-        all_weight = torch.cat(all_weight,0)
-
-        rays = Rays(origins=all_origins, viewdirs=all_viewdirs)
+        rays = Rays(origins=rgba_ray_o, viewdirs=rgba_ray_d)
+        depth_rays = depth_Rays(origins=dep_ray_o, viewdirs=dep_ray_d, depths=dep_depth, weights=dep_weight)
 
         return {
-            "rgba": all_rgba,  # [h, w, 4] or [num_rays, 4]
+            "rgba": rgba_rgba,  # [h, w, 4] or [num_rays, 4]
             "rays": rays,  # [h, w, 3] or [num_rays, 3]
-            "depth": all_depth, 
-            "weight": all_weight,
+            "depth_rgba": dep_rgba, 
+            "depth_rays": depth_rays,
         }
