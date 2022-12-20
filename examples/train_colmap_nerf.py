@@ -44,13 +44,18 @@ if __name__ == "__main__":
     render_n_samples = 1024
 
     #---------------------------------------------------------------------------------------------------------------------------------------
-    from datasets.nerf_synthetic2 import SubjectLoader
+    from datasets.nerf_colmap import SubjectLoader
     from datasets.nerf_test_poses import SubjectTestPoseLoader
     data_root_fp = "/home/ubuntu/ws/data/nerf"
     target_sample_batch_size = 1 << 20
     grid_resolution = [256, 256, 256]
 
     #---------------------------------------------------------------------------------------------------------------------------------------
+    '''depth_gts = load_colmap_depth(args.datadir, factor=args.factor, bd_factor=.75)
+        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
+                                                                  recenter=True, bd_factor=.75,
+                                                                  spherify=args.spherify)'''
+    
     dataset = SubjectLoader(subject_id=args.scene,root_fp=data_root_fp,split="train",num_rays=target_sample_batch_size // render_n_samples)
     # dataset.images = dataset.images.to(device)
     dataset.camtoworlds = dataset.camtoworlds.to(device)
@@ -79,7 +84,7 @@ if __name__ == "__main__":
     far_plane = None
     render_step_size = ((scene_aabb[3:] - scene_aabb[:3]).max() * math.sqrt(3) / render_n_samples).item()
     alpha_thre = 0.0
-    print("Using aabb", args.aabb, render_step_size)
+    print(f"Using aabb: {args.aabb}, stepsize: {render_step_size}")
 
     #---------------------------------------------------------------------------------------------------------------------------------------
     # setup the radiance field we want to train.
@@ -188,6 +193,8 @@ if __name__ == "__main__":
             render_bkgd = data["color_bkgd"]
             rays = data["rays"]
             pixels = data["pixels"]
+            depths = -data["depth"]
+            weights = data["weight"]
 
             def occ_eval_fn(x):
                 if args.cone_angle > 0.0:
@@ -231,6 +238,7 @@ if __name__ == "__main__":
                 alpha_thre=alpha_thre,
             )
             if n_rendering_samples == 0:
+                print("No samples rendered")
                 continue
 
             # dynamic batch size for rays to keep sample batch size constant.
@@ -242,6 +250,7 @@ if __name__ == "__main__":
 
             # compute loss
             loss = F.smooth_l1_loss(rgb[alive_ray_mask], pixels[alive_ray_mask])
+            loss += torch.mean(((depth[alive_ray_mask] - depths[alive_ray_mask]) ** 2) * weights[alive_ray_mask])
             optimizer.zero_grad()
             # do not unscale it because we are using Adam.
             grad_scaler.scale(loss).backward()
