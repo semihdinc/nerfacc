@@ -223,6 +223,7 @@ class SubjectLoader(torch.utils.data.Dataset):
         
         self.images, self.camtoworlds, self.focal, self.K, self.aabb, self.depth_gts = _load_renderings(root_fp, subject_id, split)
 
+        
 
         # self.images = torch.from_numpy(self.images).to(torch.uint8)
         self.camtoworlds = torch.from_numpy(self.camtoworlds).to(torch.float32)
