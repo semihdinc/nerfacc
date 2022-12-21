@@ -120,6 +120,7 @@ def _load_renderings(root_fp: str, subject_id: str, split: str):
     coord_list = [] # Sparse point pixel locations in image [N, points, X, Y]
     weight_list = [] # Reprojection Errors (N, points)
     size_list = [] # Number of points in each image
+    xyz_list = []
     for i, im_id in enumerate(col_images):
         col_image = col_images[im_id]
         pts3D_id = col_image.point3D_ids[col_image.point3D_ids > -1]
@@ -134,6 +135,7 @@ def _load_renderings(root_fp: str, subject_id: str, split: str):
             point3D.append(points)
             errs.append(col_points[id].error)
 
+        xyz_list.append(np.stack(point3D))
         depth_list.append(np.stack(depth))
         weight_list.append(2 * np.exp(-(errs/proj_errs_mean)**2))
 
@@ -150,12 +152,12 @@ def _load_renderings(root_fp: str, subject_id: str, split: str):
         frames["file_path"] = image_paths[i]
         frames["transform_matrix"] = c2w.tolist()
         meta["frames"].append(frames)
-        
+
     with open(json_out, "w") as fp:
         json.dump(meta, fp, indent=2)
 
 
-    depth_gts = {"depth":np.array(depth_list), "coord":np.array(coord_list), "weight":np.array(weight_list), "size": size_list}
+    depth_gts = {"depth":np.array(depth_list), "coord":np.array(coord_list), "weight":np.array(weight_list), "size": size_list, "xyz": xyz_list}
     return images, camtoworlds, focal, intrinsics, aabb, depth_gts
 
 def get_rays_by_coord_np(H, W, focal, c2w, coords):
