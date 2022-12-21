@@ -62,6 +62,7 @@ def _load_renderings(root_fp: str, subject_id: str, split: str):
     images = [] # image matrix (N, W, H)
     camtoworlds = [] # Poses (N, 4, 4)
     intrinsics = [] # Instrinsics (N, 3, 3) [[focal, 0, cx], [0, focal, cy], [0, 0, 1]]
+    image_paths = []
     up = np.zeros(3)
     for i in col_images:
         col_image = col_images[i]
@@ -71,6 +72,7 @@ def _load_renderings(root_fp: str, subject_id: str, split: str):
         else:
             images.append(imageio.imread(image_path))
 
+        image_paths.append(image_path)
         R = col_image.qvec2rotmat()
         t = col_image.tvec.reshape([3,1])
         bottom = np.array([0,0,0,1.]).reshape([1,4])
@@ -134,7 +136,24 @@ def _load_renderings(root_fp: str, subject_id: str, split: str):
 
         depth_list.append(np.stack(depth))
         weight_list.append(2 * np.exp(-(errs/proj_errs_mean)**2))
-    
+
+    import json
+    json_out = "/home/ubuntu/ws/data/nerf/shuttleTest8png/transforms.json"
+    meta = {"frames": []}
+    frames = {}
+    for i, c2w in enumerate(camtoworlds):
+        frames["fl_x"] = intrinsics[i][0,0]
+        frames["cx"] = intrinsics[i][0,2]
+        frames["cy"] = intrinsics[i][1,2]
+        frames["w"] = images[i].shape[1]
+        frames["h"] = images[i].shape[0]
+        frames["file_path"] = image_paths[i]
+        frames["transform_matrix"] = c2w.tolist()
+        meta["frames"].append(frames)
+        
+    with open(json_out, "w") as fp:
+        json.dump(meta, fp, indent=2)
+
 
     depth_gts = {"depth":np.array(depth_list), "coord":np.array(coord_list), "weight":np.array(weight_list), "size": size_list}
     return images, camtoworlds, focal, intrinsics, aabb, depth_gts

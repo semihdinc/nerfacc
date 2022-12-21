@@ -100,6 +100,6 @@ def parse_args():
 if __name__ == '__main__':
    np.set_printoptions(suppress=True)
    args = parse_args()
-   args.data_dir = "/Users/semih.dinc/Desktop/IW_Imagesets/shuttle_enu_0_10/"
+   args.data_dir = "/home/ubuntu/ws/data/nerf/shuttleTest8png/"
    analyzeRays(args.data_dir, args.show_rays)
    
