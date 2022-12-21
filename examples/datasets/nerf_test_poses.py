@@ -21,7 +21,9 @@ def sphericalPoses(p0,numberOfFrames):
       Z_c == Z_w or U (up)
       Camera is positioned at [0,0,tz] it is actually looking down to -Z direction 
    """
-   transMat = np.array([[1,0,0,0],[0,1,0,0],[0,0,1,1750],[0,0,0,1]]).astype(float) #move camera to 0,0,1500
+   mean_height = np.linalg.norm(p0[:3, 3])
+   print(f"Norm height for spherical poses: {mean_height}")
+   transMat = np.array([[1,0,0,0],[0,1,0,0],[0,0,1,mean_height],[0,0,0,1]]).astype(float) #move camera to 0,0,1500
    
    #rotate camera 45 degrees wrt X axis
    rotMatX = np.identity(4)

@@ -30,7 +30,7 @@ if __name__ == "__main__":
     parser.add_argument("--exp_name",type=str,default="exp",help="The name of the folder for saving results")
     parser.add_argument("--scene",type=str,default="lego",help="which scene to use")
     parser.add_argument("--test_chunk_size",type=int,default=8192)
-    parser.add_argument("--max_steps",type=int,default=3000, help="Max number of training iterations")
+    parser.add_argument("--max_steps",type=int,default=30000, help="Max number of training iterations")
     parser.add_argument("--cone_angle", type=float, default=0.0)
     parser.add_argument("--i_ckpt",type=int, default=1000, help="Iterations to save model")
     parser.add_argument("--render_only",action="store_true",help="whether to only render images")
@@ -44,13 +44,18 @@ if __name__ == "__main__":
     render_n_samples = 1024
 
     #---------------------------------------------------------------------------------------------------------------------------------------
-    from datasets.nerf_synthetic2 import SubjectLoader
+    from datasets.nerf_colmap import SubjectLoader
     from datasets.nerf_test_poses import SubjectTestPoseLoader
     data_root_fp = "/home/ubuntu/ws/data/nerf"
     target_sample_batch_size = 1 << 20
     grid_resolution = [256, 256, 256]
 
     #---------------------------------------------------------------------------------------------------------------------------------------
+    '''depth_gts = load_colmap_depth(args.datadir, factor=args.factor, bd_factor=.75)
+        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
+                                                                  recenter=True, bd_factor=.75,
+                                                                  spherify=args.spherify)'''
+    
     dataset = SubjectLoader(subject_id=args.scene,root_fp=data_root_fp,split="train",num_rays=target_sample_batch_size // render_n_samples)
     # dataset.images = dataset.images.to(device)
     dataset.camtoworlds = dataset.camtoworlds.to(device)
@@ -79,7 +84,7 @@ if __name__ == "__main__":
     far_plane = None
     render_step_size = ((scene_aabb[3:] - scene_aabb[:3]).max() * math.sqrt(3) / render_n_samples).item()
     alpha_thre = 0.0
-    print("Using aabb", args.aabb, render_step_size)
+    print(f"Using aabb: {args.aabb}, stepsize: {render_step_size}")
 
     #---------------------------------------------------------------------------------------------------------------------------------------
     # setup the radiance field we want to train.
@@ -188,6 +193,8 @@ if __name__ == "__main__":
             render_bkgd = data["color_bkgd"]
             rays = data["rays"]
             pixels = data["pixels"]
+            depth_rays = data["depth_rays"]
+            depth_pixels = data["depth_pixels"]
 
             def occ_eval_fn(x):
                 if args.cone_angle > 0.0:
@@ -216,7 +223,7 @@ if __name__ == "__main__":
             # update occupancy grid
             occupancy_grid.every_n_step(step=step, occ_eval_fn=occ_eval_fn)
 
-            # render
+            # render rgba
             rgb, acc, depth, n_rendering_samples = render_image(
                 radiance_field,
                 occupancy_grid,
@@ -230,18 +237,40 @@ if __name__ == "__main__":
                 cone_angle=args.cone_angle,
                 alpha_thre=alpha_thre,
             )
-            if n_rendering_samples == 0:
+            # render depth
+            _rgb, _acc, _depth, _n_rendering_samples = render_image(
+                radiance_field,
+                occupancy_grid,
+                depth_rays,
+                scene_aabb,
+                # rendering options
+                near_plane=near_plane,
+                far_plane=far_plane,
+                render_step_size=render_step_size,
+                render_bkgd=render_bkgd,
+                cone_angle=args.cone_angle,
+                alpha_thre=alpha_thre,
+            )
+            total_rendered = n_rendering_samples+_n_rendering_samples
+            total_rgb = torch.concat([rgb, _rgb], 0)
+            total_acc = torch.concat([acc, _acc], 0)
+            total_pixels = torch.concat([pixels, depth_pixels], 0)
+
+            if total_rendered == 0:
+                print("No samples rendered")
                 continue
 
             # dynamic batch size for rays to keep sample batch size constant.
-            num_rays = len(pixels)
-            num_rays = int(num_rays * (target_sample_batch_size / float(n_rendering_samples)))
+            num_rays = len(pixels)+len(depth_pixels)
+            num_rays = int(num_rays * (target_sample_batch_size / float(total_rendered)))
 
             dataset.update_num_rays(num_rays)
-            alive_ray_mask = acc.squeeze(-1) > 0
+            alive_ray_mask = total_acc.squeeze(-1) > 0
+            depth_ray_mask = alive_ray_mask[len(rgb):]
 
             # compute loss
-            loss = F.smooth_l1_loss(rgb[alive_ray_mask], pixels[alive_ray_mask])
+            loss = F.smooth_l1_loss(total_rgb[alive_ray_mask], total_pixels[alive_ray_mask])
+            loss += torch.mean(((_depth[depth_ray_mask] + depth_rays.depths[depth_ray_mask]) ** 2) * depth_rays.weights[depth_ray_mask])
             optimizer.zero_grad()
             # do not unscale it because we are using Adam.
             grad_scaler.scale(loss).backward()
@@ -251,14 +280,14 @@ if __name__ == "__main__":
             #==================================================================================
             if step % 100 == 0:
                 elapsed_time = time.time() - tic
-                loss = F.mse_loss(rgb[alive_ray_mask], pixels[alive_ray_mask])
+                loss = F.mse_loss(total_rgb[alive_ray_mask], total_pixels[alive_ray_mask])
                 psnr = -10.0 * torch.log(loss) / np.log(10.0)
                 writer.add_scalar("mse/train", loss, step)
                 writer.add_scalar("psnr/train", psnr, step)
                 
                 print(
                     f"elapsed_time={elapsed_time:.2f}s | step={step} | "
-                    f"loss={loss:.5f} | "
+                    f"loss={loss:.5f} ({psnr})| "
                     f"alive_ray_mask={alive_ray_mask.long().sum():d} | "
                     f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} |"
                 )
