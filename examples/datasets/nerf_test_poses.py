@@ -63,10 +63,11 @@ def generateSphericalTestPoses(root_fp: str, subject_id: str, numberOfFrames: in
 
    w, h = frame['w']/factor, frame['h']/factor
 
+   aabb = meta["aabb"]
    c2w = np.array(frame["transform_matrix"])
    camtoworlds = sphericalPoses(c2w, numberOfFrames)
 
-   return camtoworlds, K, int(w), int(h)
+   return camtoworlds, K, int(w), int(h), aabb
 
 
 class SubjectTestPoseLoader(torch.utils.data.Dataset):
@@ -77,7 +78,7 @@ class SubjectTestPoseLoader(torch.utils.data.Dataset):
       super().__init__()
       
       self.color_bkgd_aug = color_bkgd_aug
-      self.camtoworlds, self.K, self.WIDTH, self.HEIGHT = generateSphericalTestPoses(root_fp, subject_id, numberOfFrames, downscale_factor)
+      self.camtoworlds, self.K, self.WIDTH, self.HEIGHT, self.aabb = generateSphericalTestPoses(root_fp, subject_id, numberOfFrames, downscale_factor)
 
       self.camtoworlds = torch.from_numpy(self.camtoworlds).to(torch.float32)
       self.K = torch.from_numpy(self.K).to(torch.float32)
@@ -119,6 +120,53 @@ class SubjectTestPoseLoader(torch.utils.data.Dataset):
       # [n_cams, height, width, 3]
       directions = (camera_dirs[:, None, :] * c2w[:, :3, :3]).sum(dim=-1)
       origins = torch.broadcast_to(c2w[:, :3, -1], directions.shape)
+      viewdirs = directions / torch.linalg.norm(
+         directions, dim=-1, keepdims=True
+      )
+
+      origins = torch.reshape(origins, (self.HEIGHT, self.WIDTH, 3))
+      viewdirs = torch.reshape(viewdirs, (self.HEIGHT, self.WIDTH, 3))
+
+      rays = Rays(origins=origins, viewdirs=viewdirs)
+
+      if self.color_bkgd_aug == "random":
+         color_bkgd = torch.rand(3, device=self.camtoworlds.device)
+      elif self.color_bkgd_aug == "white":
+         color_bkgd = torch.ones(3, device=self.camtoworlds.device)
+      elif self.color_bkgd_aug == "black":
+         color_bkgd = torch.zeros(3, device=self.camtoworlds.device)
+
+      return {
+         "rays": rays,  # [h, w, 3] or [num_rays, 3]
+         "color_bkgd": color_bkgd
+      }
+
+   def get_rays(self, c2w):
+
+      x, y = torch.meshgrid(
+            torch.arange(self.WIDTH, device=self.camtoworlds.device),
+            torch.arange(self.HEIGHT, device=self.camtoworlds.device),
+            indexing="xy",
+      )
+      x = x.flatten()
+      y = y.flatten()
+
+      K = self.K
+      camera_dirs = F.pad(
+         torch.stack(
+               [
+                  (x - K[0, 2] + 0.5) / K[0, 0],
+                  (y - K[1, 2] + 0.5) / K[1, 1] * (-1.0 if self.OPENGL_CAMERA else 1.0),
+               ],
+               dim=-1,
+         ),
+         (0, 1),
+         value=(-1.0 if self.OPENGL_CAMERA else 1.0),
+      )  # [num_rays, 3]
+
+      # [n_cams, height, width, 3]
+      directions = (camera_dirs[:, None, :] * c2w[:3, :3]).sum(dim=-1)
+      origins = torch.broadcast_to(c2w[:3, -1], directions.shape)
       viewdirs = directions / torch.linalg.norm(
          directions, dim=-1, keepdims=True
       )
