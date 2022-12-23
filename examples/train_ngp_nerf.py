@@ -228,13 +228,6 @@ if __name__ == "__main__":
                     # compute actual step size used in marching, based on the distance to the camera.
                     step_size = torch.clamp(t * args.cone_angle, min=render_step_size)
                     
-                    # filter out the points that are not in the near far plane.
-                    if (near_plane is not None) and (far_plane is not None):
-                        step_size = torch.where(
-                            (t > near_plane) & (t < far_plane),
-                            step_size,
-                            torch.zeros_like(step_size),
-                        )
                 else:
                     step_size = render_step_size
                 
