@@ -5,6 +5,7 @@ import time
 import math
 import os
 import glob
+import cv2
 
 import dearpygui.dearpygui as dpg
 from scipy.spatial.transform import Rotation as R
@@ -27,7 +28,7 @@ class OrbitCamera:
     def pose(self):
         # first move camera to radius
         res = np.eye(4)
-        res[2, 3] -= self.radius
+        res[2, 3] += self.radius
         # rotate
         rot = np.eye(4)
         rot[:3, :3] = self.rot
@@ -51,14 +52,16 @@ class OrbitCamera:
 
 
 class NGPGUI:
-    def __init__(self, radiance_field, occupancy_grid, render_aabb, testPoses, render_step_size, radius=2000):
+    def __init__(self, radiance_field, occupancy_grid, render_aabb, testPoses, render_step_size, cone_angle, alpha_thre, radius=2500):
 
         self.radiance_field = radiance_field
         self.occupancy_grid = occupancy_grid
         self.render_aabb = render_aabb
         self.render_step_size = render_step_size
-        self.K = testPoses.K
-        self.W, self.H = testPoses.WIDTH, testPoses.HEIGHT
+        self.cone_angle = cone_angle
+        self.alpha_thre = alpha_thre
+
+        self.K, self.W, self.H = testPoses.K, testPoses.WIDTH, testPoses.HEIGHT
         self.testPoses = testPoses
 
         self.cam = OrbitCamera(self.K, self.W, self.H, r=radius)
@@ -75,42 +78,48 @@ class NGPGUI:
     def render_cam(self, cam):
         t = time.time()
 
-        c2w = torch.tensor(cam.pose,device='cuda:0')
+        c2w = torch.tensor(cam.pose,dtype=torch.float,device='cuda:0')
 
-        testPoses.training = False
         data = self.testPoses.get_rays(c2w)
         render_bkgd = data["color_bkgd"]
         rays = data["rays"]
 
-        # rendering
-        rgb, _, _, _ = render_image(
-            self.radiance_field,
-            self.occupancy_grid,
-            rays,
-            self.render_aabb,
-            render_step_size=self.render_step_size,
-            render_bkgd=render_bkgd,
-            cone_angle=0.0,
-            alpha_thre=0.0,
-            # test options
-            test_chunk_size=8192,
-        )
-        #save rgb image
-        rgbImage = (rgb.cpu().numpy() * 255).astype(np.uint8)
+        self.radiance_field.eval()
+        with torch.no_grad():
+            # rendering
+            rgb, acc, depth, _ = render_image(
+                self.radiance_field,
+                self.occupancy_grid,
+                rays,
+                self.render_aabb,
+                render_step_size = self.render_step_size,
+                render_bkgd=render_bkgd,
+                cone_angle=self.cone_angle,
+                alpha_thre=self.alpha_thre,
+                # test options
+                test_chunk_size=args.test_chunk_size,
+            )
+        # save rgb image
+        rgbImage = rgb.cpu().numpy()
+
+        cmd = dpg.get_value('colormap_depth')
+        depthImage = depth.cpu().numpy()
+        depthImage = depthImage[...,-1]
+        depthImage[depthImage < cmd] = cmd
+        depthImage = (depthImage-depthImage.min())/(depthImage.max()-depthImage.min())
+        depthImage = cv2.applyColorMap((depthImage*255).astype(np.uint8), cv2.COLORMAP_TURBO)
 
         torch.cuda.synchronize()
         self.dt = time.time()-t
-        
-        return rgbImage
 
-        # if self.img_mode == 0:
-        #     return rgbImage
-        # elif self.img_mode == 1:
-        #     return depth2img(depth).astype(np.float32)/255.0
+        if self.img_mode == 0:
+            return rgbImage
+        elif self.img_mode == 1:
+            return depthImage.astype(np.float32)/255.0
 
     def register_dpg(self):
         dpg.create_context()
-        dpg.create_viewport(title="ngp_pl", width=self.W, height=self.H, resizable=False)
+        dpg.create_viewport(title="nerfacc", width=self.W, height=self.H, resizable=False)
 
         ## register texture ##
         with dpg.texture_registry(show=False):
@@ -131,10 +140,8 @@ class NGPGUI:
 
         ## control window ##
         with dpg.window(label="Control", tag="_control_window", width=200, height=150):
-            dpg.add_slider_float(label="exposure", default_value=0.2,
-                                 min_value=1/60, max_value=32, tag="_exposure")
-            dpg.add_button(label="show depth", tag="_button_depth",
-                            callback=callback_depth)
+            dpg.add_slider_float(label="min depth", default_value=0,min_value=1500, max_value=3000, tag="colormap_depth")
+            dpg.add_button(label="depth/color", tag="_button_depth",callback=callback_depth)
             dpg.add_separator()
             dpg.add_text('no data', tag="_log_time")
             dpg.add_text('no data', tag="_samples_per_ray")
@@ -156,26 +163,17 @@ class NGPGUI:
             self.cam.pan(app_data[1], app_data[2])
 
         with dpg.handler_registry():
-            dpg.add_mouse_drag_handler(
-                button=dpg.mvMouseButton_Left, callback=callback_camera_drag_rotate
-            )
+            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, callback=callback_camera_drag_rotate)
             dpg.add_mouse_wheel_handler(callback=callback_camera_wheel_scale)
-            dpg.add_mouse_drag_handler(
-                button=dpg.mvMouseButton_Middle, callback=callback_camera_drag_pan
-            )
+            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Middle, callback=callback_camera_drag_pan)
 
         ## Avoid scroll bar in the window ##
         with dpg.theme() as theme_no_padding:
             with dpg.theme_component(dpg.mvAll):
-                dpg.add_theme_style(
-                    dpg.mvStyleVar_WindowPadding, 0, 0, category=dpg.mvThemeCat_Core
-                )
-                dpg.add_theme_style(
-                    dpg.mvStyleVar_FramePadding, 0, 0, category=dpg.mvThemeCat_Core
-                )
-                dpg.add_theme_style(
-                    dpg.mvStyleVar_CellPadding, 0, 0, category=dpg.mvThemeCat_Core
-                )
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0, category=dpg.mvThemeCat_Core)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0, category=dpg.mvThemeCat_Core)
+                dpg.add_theme_style(dpg.mvStyleVar_CellPadding, 0, 0, category=dpg.mvThemeCat_Core)
+
         dpg.bind_item_theme("_primary_window", theme_no_padding)
 
         ## Launch the gui ##
@@ -204,6 +202,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_steps",type=int,default=30000, help="Max number of training iterations")
     parser.add_argument("--cone_angle", type=float, default=0.0)
     parser.add_argument("--i_ckpt",type=int, default=1000, help="Iterations to save model")
+    parser.add_argument("--render_only",action="store_true",help="whether to only render images")
 
     #currently useless options
     parser.add_argument("--i_test",type=int, default=5000, help="Iterations to render test poses and create video") 
@@ -216,10 +215,10 @@ if __name__ == "__main__":
     data_root_fp = "/home/ubuntu/data/"
     render_n_samples = 1024
     target_sample_batch_size = 1 << 20
-    grid_resolution = [400, 400, 100]
+    grid_resolution = [500, 300, 100]
 
     #---------------------------------------------------------------------------------------------------------------------------------------
-    testPoses = SubjectTestPoseLoader(subject_id=args.scene,root_fp=data_root_fp,numberOfFrames=120, downscale_factor=4)
+    testPoses = SubjectTestPoseLoader(subject_id=args.scene,root_fp=data_root_fp,numberOfFrames=120, downscale_factor=1)
     testPoses.camtoworlds = testPoses.camtoworlds.to(device)
     testPoses.K = testPoses.K.to(device)
 
@@ -261,7 +260,7 @@ if __name__ == "__main__":
         print(f"Previous Training Loss: loss={model['loss']:.5f}")
 
     #---------------------------------------------------------------------------------------------------------------------------------------
-    NGPGUI(radiance_field, occupancy_grid, render_aabb, testPoses, render_step_size).render()
+    NGPGUI(radiance_field, occupancy_grid, render_aabb, testPoses, render_step_size, args.cone_angle, alpha_thre).render()
     dpg.destroy_context()
 
 
