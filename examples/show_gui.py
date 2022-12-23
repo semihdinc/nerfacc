@@ -215,10 +215,10 @@ if __name__ == "__main__":
     data_root_fp = "/home/ubuntu/data/"
     render_n_samples = 1024
     target_sample_batch_size = 1 << 20
-    grid_resolution = [500, 300, 100]
+    grid_resolution = [400, 400, 100]
 
     #---------------------------------------------------------------------------------------------------------------------------------------
-    testPoses = SubjectTestPoseLoader(subject_id=args.scene,root_fp=data_root_fp,numberOfFrames=120, downscale_factor=1)
+    testPoses = SubjectTestPoseLoader(subject_id=args.scene,root_fp=data_root_fp,numberOfFrames=120, downscale_factor=2)
     testPoses.camtoworlds = testPoses.camtoworlds.to(device)
     testPoses.K = testPoses.K.to(device)
 
