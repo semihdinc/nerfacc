@@ -38,21 +38,21 @@ class OrbitCamera:
         return res
 
     def orbit(self, dx, dy):
-        rotvec_x = self.rot[:, 1] * np.radians(0.05 * dx)
+        rotvec_x = self.rot[:, 1] * np.radians(-0.05 * dx)
         rotvec_y = self.rot[:, 0] * np.radians(-0.05 * dy)
         self.rot = R.from_rotvec(rotvec_y).as_matrix() @ \
                    R.from_rotvec(rotvec_x).as_matrix() @ \
                    self.rot
 
     def scale(self, delta):
-        self.radius *= 1.1 ** (-delta)
+        self.radius *= 1.01 ** (-delta)
 
     def pan(self, dx, dy, dz=0):
-        self.center += 1e-4 * self.rot @ np.array([dx, dy, dz])
+        self.center += 0.05 * self.rot @ np.array([dx, -dy, dz])
 
 
 class NGPGUI:
-    def __init__(self, radiance_field, occupancy_grid, render_aabb, testPoses, render_step_size, cone_angle, alpha_thre, radius=2500):
+    def __init__(self, radiance_field, occupancy_grid, render_aabb, testPoses, render_step_size, cone_angle, alpha_thre, radius=2000):
 
         self.radiance_field = radiance_field
         self.occupancy_grid = occupancy_grid
@@ -67,11 +67,18 @@ class NGPGUI:
         self.cam = OrbitCamera(self.K, self.W, self.H, r=radius)
 
         self.render_buffer = np.ones((self.W, self.H, 3), dtype=np.float32)
+        self.dImg = np.ones((self.W, self.H), dtype=np.float32)
 
         # placeholders
         self.dt = 0
         self.mean_samples = 0
         self.img_mode = 0
+        self.proj_mode = 0
+
+        self.sc = 2 #image resolution scale
+
+        #mouse x,y
+        self.x, self.y = 0, 0
 
         self.register_dpg()
 
@@ -80,7 +87,12 @@ class NGPGUI:
 
         c2w = torch.tensor(cam.pose,dtype=torch.float,device='cuda:0')
 
-        data = self.testPoses.get_rays(c2w)
+
+        if self.proj_mode == 0:
+            data = self.testPoses.get_rays(c2w)
+        else:
+            data = self.testPoses.get_nadir_rays(c2w)
+        
         render_bkgd = data["color_bkgd"]
         rays = data["rays"]
 
@@ -105,6 +117,9 @@ class NGPGUI:
         cmd = dpg.get_value('colormap_depth')
         depthImage = depth.cpu().numpy()
         depthImage = depthImage[...,-1]
+        
+        self.dImg = depthImage
+        
         depthImage[depthImage < cmd] = cmd
         depthImage = (depthImage-depthImage.min())/(depthImage.max()-depthImage.min())
         depthImage = cv2.applyColorMap((depthImage*255).astype(np.uint8), cv2.COLORMAP_TURBO)
@@ -113,38 +128,39 @@ class NGPGUI:
         self.dt = time.time()-t
 
         if self.img_mode == 0:
+            rgbImage = cv2.resize(rgbImage, (self.sc*self.W,self.sc*self.H), interpolation = cv2.INTER_AREA)
             return rgbImage
         elif self.img_mode == 1:
+            depthImage = cv2.resize(depthImage, (self.sc*self.W,self.sc*self.H), interpolation = cv2.INTER_AREA)
             return depthImage.astype(np.float32)/255.0
 
     def register_dpg(self):
         dpg.create_context()
-        dpg.create_viewport(title="nerfacc", width=self.W, height=self.H, resizable=False)
+        dpg.create_viewport(title="nerfacc", width=self.sc*self.W, height=self.sc*self.H, resizable=False)
 
         ## register texture ##
         with dpg.texture_registry(show=False):
-            dpg.add_raw_texture(
-                self.W,
-                self.H,
-                self.render_buffer,
-                format=dpg.mvFormat_Float_rgb,
-                tag="_texture")
+            dpg.add_raw_texture(self.sc*self.W,self.sc*self.H,self.render_buffer,format=dpg.mvFormat_Float_rgb,tag="_texture")
 
         ## register window ##
-        with dpg.window(tag="_primary_window", width=self.W, height=self.H):
+        with dpg.window(tag="_primary_window", width=self.sc*self.W, height=self.sc*self.H):
             dpg.add_image("_texture")
+            
         dpg.set_primary_window("_primary_window", True)
 
         def callback_depth(sender, app_data):
             self.img_mode = 1-self.img_mode
 
+        def callback_proj(sender, app_data):
+            self.proj_mode = 1-self.proj_mode
+
         ## control window ##
         with dpg.window(label="Control", tag="_control_window", width=200, height=150):
-            dpg.add_slider_float(label="min depth", default_value=0,min_value=1500, max_value=3000, tag="colormap_depth")
+            dpg.add_slider_float(label="min depth", default_value=1500,min_value=0, max_value=3000, tag="colormap_depth")
             dpg.add_button(label="depth/color", tag="_button_depth",callback=callback_depth)
+            dpg.add_button(label="perspective/parallel", tag="_button_proj",callback=callback_proj)
             dpg.add_separator()
             dpg.add_text('no data', tag="_log_time")
-            dpg.add_text('no data', tag="_samples_per_ray")
 
         ## register camera handler ##
         def callback_camera_drag_rotate(sender, app_data):
@@ -162,10 +178,23 @@ class NGPGUI:
                 return
             self.cam.pan(app_data[1], app_data[2])
 
+        def callback_click_test(sender, app_data):
+            if not dpg.is_item_focused("_primary_window"):
+                return
+            x,y = dpg.get_mouse_pos(local=True)
+            self.x, self.y = int(x), int(y+19)
+            dpg.draw_circle((self.x, self.y), 1, color=(255, 0, 0, 255), parent='_primary_window')
+            dpg.draw_text((self.x, self.y),
+                          text = f'({self.x},{self.y}):{self.dImg[int(self.y/self.sc),int(self.x/self.sc)]:.1f}m',
+                          color = (255, 0, 0, 255),
+                          size = 15,
+                          parent='_primary_window')
+
         with dpg.handler_registry():
             dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, callback=callback_camera_drag_rotate)
             dpg.add_mouse_wheel_handler(callback=callback_camera_wheel_scale)
-            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Middle, callback=callback_camera_drag_pan)
+            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Right, callback=callback_camera_drag_pan)
+            dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Middle, callback=callback_click_test)
 
         ## Avoid scroll bar in the window ##
         with dpg.theme() as theme_no_padding:
@@ -186,7 +215,6 @@ class NGPGUI:
         while dpg.is_dearpygui_running():
             dpg.set_value("_texture", self.render_cam(self.cam))
             dpg.set_value("_log_time", f'Render time: {1000*self.dt:.2f} ms')
-            dpg.set_value("_samples_per_ray", f'Samples/ray: {self.mean_samples:.2f}')
             dpg.render_dearpygui_frame()
 
 
@@ -218,7 +246,7 @@ if __name__ == "__main__":
     grid_resolution = [400, 400, 100]
 
     #---------------------------------------------------------------------------------------------------------------------------------------
-    testPoses = SubjectTestPoseLoader(subject_id=args.scene,root_fp=data_root_fp,numberOfFrames=120, downscale_factor=2)
+    testPoses = SubjectTestPoseLoader(subject_id=args.scene,root_fp=data_root_fp,numberOfFrames=120, downscale_factor=4)
     testPoses.camtoworlds = testPoses.camtoworlds.to(device)
     testPoses.K = testPoses.K.to(device)
 
