@@ -187,3 +187,47 @@ class SubjectTestPoseLoader(torch.utils.data.Dataset):
          "rays": rays,  # [h, w, 3] or [num_rays, 3]
          "color_bkgd": color_bkgd
       }
+
+   def get_nadir_rays(self, c2w):
+
+      
+
+      y = torch.tensor([self.aabb[0][1], self.aabb[1][1]], device=self.camtoworlds.device)
+      x = y * (self.WIDTH/self.HEIGHT)
+
+      xs = torch.linspace(x[0], x[1], steps=self.WIDTH, device=self.camtoworlds.device)
+      ys = torch.linspace(-y[0], -y[1], steps=self.HEIGHT, device=self.camtoworlds.device)
+
+      # xs = torch.linspace(-self.WIDTH/2, self.WIDTH/2, steps=self.WIDTH, device=self.camtoworlds.device)
+      # ys = torch.linspace(self.HEIGHT/2, -self.HEIGHT/2, steps=self.HEIGHT, device=self.camtoworlds.device)
+
+      x, y = torch.meshgrid(xs, ys, indexing="xy")
+      x = x.flatten()
+      y = y.flatten()
+
+      #all rays have same z value, from camera center
+      z = torch.ones([x.shape[0],],device=self.camtoworlds.device) * c2w[2,3]
+
+      #every ray has a different origin
+      origins =  torch.stack([x,y,z],dim=-1)
+
+      #all rays have same view directions [0,0,-1] because all are ortagonal to surface
+      viewdirs = torch.broadcast_to(torch.tensor([0.0,0.0,-1.0],device=self.camtoworlds.device), origins.shape)
+
+      #Convert rays into [h, w, 3] format
+      origins = torch.reshape(origins, (self.HEIGHT, self.WIDTH, 3))
+      viewdirs = torch.reshape(viewdirs, (self.HEIGHT, self.WIDTH, 3))
+
+      rays = Rays(origins=origins, viewdirs=viewdirs)
+
+      if self.color_bkgd_aug == "random":
+         color_bkgd = torch.rand(3, device=self.camtoworlds.device)
+      elif self.color_bkgd_aug == "white":
+         color_bkgd = torch.ones(3, device=self.camtoworlds.device)
+      elif self.color_bkgd_aug == "black":
+         color_bkgd = torch.zeros(3, device=self.camtoworlds.device)
+
+      return {
+         "rays": rays,  # [h, w, 3] or [num_rays, 3]
+         "color_bkgd": color_bkgd
+      }
