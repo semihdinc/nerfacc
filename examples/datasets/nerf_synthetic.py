@@ -23,6 +23,7 @@ def _load_renderings(root_fp: str, subject_id: str, split: str):
     images = []
     camtoworlds = []
     intrinsics = []
+    depths = np.empty([4,0], dtype=float)
     for i in range(len(meta["frames"])):
         frame = meta["frames"][i]
         fname = os.path.join(data_dir, frame['file_path'][2:])
@@ -35,12 +36,22 @@ def _load_renderings(root_fp: str, subject_id: str, split: str):
         K = np.array([[focal, 0, cx], [0, focal, cy], [0, 0, 1]])
         intrinsics.append(K)
 
+        #depth images
+        depth_path = os.path.join(data_dir,'depth',os.path.basename(fname).split('.')[0]+'.npy')
+        pts = np.load(depth_path)
+        
+        idx = np.ones([1, pts.shape[1]]) * i
+        pts = np.vstack((idx,pts))
+
+        depths = np.append(depths,pts,axis=1)
+
     images = np.stack(images, axis=0) #assume all images have same size
     camtoworlds = np.stack(camtoworlds, axis=0)
     intrinsics = np.stack(intrinsics, axis=0)
+
     aabb = meta["aabb"]
 
-    return images, camtoworlds, focal, intrinsics, aabb
+    return images, depths, camtoworlds, focal, intrinsics, aabb
 
 
 class SubjectLoader(torch.utils.data.Dataset):
@@ -67,9 +78,10 @@ class SubjectLoader(torch.utils.data.Dataset):
         self.color_bkgd_aug = color_bkgd_aug
         self.batch_over_images = batch_over_images
         
-        self.images, self.camtoworlds, self.focal, self.K, self.aabb = _load_renderings(root_fp, subject_id, split)
+        self.images, self.depths, self.camtoworlds, self.focal, self.K, self.aabb = _load_renderings(root_fp, subject_id, split)
 
         self.images = torch.from_numpy(self.images).to(torch.uint8)
+        self.depths = torch.from_numpy(self.depths).to(torch.float32)
         self.camtoworlds = torch.from_numpy(self.camtoworlds).to(torch.float32)
         self.K = torch.from_numpy(self.K).to(torch.float32)
 
@@ -170,4 +182,55 @@ class SubjectLoader(torch.utils.data.Dataset):
         return {
             "rgba": rgba,  # [h, w, 4] or [num_rays, 4]
             "rays": rays,  # [h, w, 3] or [num_rays, 3]
+        }
+
+    def get_depth_rays(self):
+        num_rays = self.num_rays
+        idx = torch.randint(0,self.depths.shape[1],size=(num_rays,),device=self.images.device)
+
+        rand_depths = self.depths[:,idx]
+        image_id, x, y, depths = np.vsplit(rand_depths, 4)
+
+        image_id = image_id.reshape([num_rays]).to(torch.long)
+        x = x.reshape([num_rays]).to(torch.long)
+        y = y.reshape([num_rays]).to(torch.long)
+
+        c2w = self.camtoworlds[image_id]  # (num_rays, 3, 4)
+        K = self.K[image_id]
+        camera_dirs = F.pad(
+            torch.stack(
+                [
+                    (x - K[:,0, 2] + 0.5) / K[:,0, 0],
+                    (y - K[:,1, 2] + 0.5) / K[:,1, 1] * (-1.0 if self.OPENGL_CAMERA else 1.0),
+                ],
+                dim=-1,
+            ),
+            (0, 1),
+            value=(-1.0 if self.OPENGL_CAMERA else 1.0),
+        )  # [num_rays, 3]
+
+        # [n_cams, height, width, 3]
+        directions = (camera_dirs[:, None, :] * c2w[:, :3, :3]).sum(dim=-1)
+        origins = torch.broadcast_to(c2w[:, :3, -1], directions.shape)
+        viewdirs = directions / torch.linalg.norm(
+            directions, dim=-1, keepdims=True
+        )
+
+        origins = torch.reshape(origins, (num_rays, 3))
+        viewdirs = torch.reshape(viewdirs, (num_rays, 3))
+        depths = torch.reshape(depths, (num_rays, 1))
+
+        rays = Rays(origins=origins, viewdirs=viewdirs)
+
+        if self.color_bkgd_aug == "random":
+            color_bkgd = torch.rand(3, device=self.camtoworlds.device)
+        elif self.color_bkgd_aug == "white":
+            color_bkgd = torch.ones(3, device=self.camtoworlds.device)
+        elif self.color_bkgd_aug == "black":
+            color_bkgd = torch.zeros(3, device=self.camtoworlds.device)
+
+        return {
+            "depths": depths,  # [h, w, 4] or [num_rays, 4]
+            "rays": rays,  # [h, w, 3] or [num_rays, 3]
+            "color_bkgd": color_bkgd
         }
