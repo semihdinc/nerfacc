@@ -55,8 +55,9 @@ if __name__ == "__main__":
     grid_resolution = [400, 400, 100]
 
     #---------------------------------------------------------------------------------------------------------------------------------------
-    dataset = SubjectLoader(subject_id=args.scene,root_fp=data_root_fp,split="train",num_rays=target_sample_batch_size // render_n_samples)
+    dataset = SubjectLoader(subject_id=args.scene,root_fp=data_root_fp,split="train",color_bkgd_aug='random',num_rays=target_sample_batch_size // render_n_samples)
     dataset.images = dataset.images.to(device)
+    dataset.depths = dataset.depths.to(device)
     dataset.camtoworlds = dataset.camtoworlds.to(device)
     dataset.K = dataset.K.to(device)
 
@@ -80,7 +81,7 @@ if __name__ == "__main__":
 
     render_step_size = ((scene_aabb[3:] - scene_aabb[:3]).max() * math.sqrt(3) / render_n_samples).item()
     alpha_thre = 0.0
-    occ_thre = 0.1
+    occ_thre = 0.01
     print("Using aabb", args.aabb, render_step_size)
 
     #---------------------------------------------------------------------------------------------------------------------------------------
@@ -107,7 +108,8 @@ if __name__ == "__main__":
         scheduler.load_state_dict(model['scheduler_state_dict']) # not critical
         occupancy_grid.load_state_dict(model['occupancy_grid_state_dict'])
         print(f"Loaded checkpoint from: {load_ckpt}")
-        print(f"Previous Training Loss: loss={model['loss']:.5f}")
+        print(f"Previous Training Color Loss: loss={model['loss']:.5f}")
+        print(f"Previous Training Depth Loss: loss={model['depth_loss']:.5f}")
 
     #---------------------------------------------------------------------------------------------------------------------------------------
     #Visualize the nerf with nerfvis and exit...
@@ -250,37 +252,61 @@ if __name__ == "__main__":
                 cone_angle=args.cone_angle,
                 alpha_thre=alpha_thre,
             )
+            alive_ray_mask = acc.squeeze(-1) > 0
 
             if n_rendering_samples == 0:
                 continue
 
+            #  #-----------------------
+            # depth_data = dataset.get_depth_rays()
+            # rays, depth_actual = depth_data["rays"], depth_data["depths"]
+            
+            # # render
+            # _, acc, depth, n_rendering_samples = render_image(
+            #     radiance_field,
+            #     occupancy_grid,
+            #     rays,
+            #     scene_aabb,
+            #     # rendering options
+            #     render_step_size=render_step_size,
+            #     render_bkgd=render_bkgd,
+            #     cone_angle=args.cone_angle,
+            #     alpha_thre=alpha_thre,
+            # )
+            # alive_ray_mask_depth = acc.squeeze(-1) > 0
+
+            # if n_rendering_samples == 0:
+            #     continue
+
             # dynamic batch size for rays to keep sample batch size constant.
             num_rays = len(pixels)
             num_rays = int(num_rays * (target_sample_batch_size / float(n_rendering_samples)))
-
             dataset.update_num_rays(num_rays)
-            alive_ray_mask = acc.squeeze(-1) > 0
 
-            # compute loss
-            loss = F.smooth_l1_loss(rgb[alive_ray_mask], pixels[alive_ray_mask])
+            # compute color loss
+            color_loss = F.smooth_l1_loss(rgb[alive_ray_mask], pixels[alive_ray_mask])
+            depth_loss = 0 #F.smooth_l1_loss(depth[alive_ray_mask_depth], depth_actual[alive_ray_mask_depth]) / 100
+
+            total_loss = color_loss + depth_loss
             optimizer.zero_grad()
             
             # do not unscale it because we are using Adam.
-            grad_scaler.scale(loss).backward()
+            grad_scaler.scale(total_loss).backward()
             optimizer.step()
             scheduler.step()
 
             #==================================================================================
             if step % 100 == 0:
                 elapsed_time = time.time() - tic
-                loss = F.mse_loss(rgb[alive_ray_mask], pixels[alive_ray_mask])
-                psnr = -10.0 * torch.log(loss) / np.log(10.0)
-                writer.add_scalar("mse/train", loss, step)
+                color_loss = F.mse_loss(rgb[alive_ray_mask], pixels[alive_ray_mask])
+                psnr = -10.0 * torch.log(color_loss) / np.log(10.0)
+                writer.add_scalar("mse/train", color_loss, step)
                 writer.add_scalar("psnr/train", psnr, step)
-                
+                writer.add_scalar("depth_loss/train",depth_loss,step)
                 print(
                     f"elapsed_time={elapsed_time:.2f}s | step={step} | "
-                    f"loss={loss:.5f} | "
+                    f"color_loss={color_loss:.5f} | "
+                    f"depth_loss={depth_loss:.5f} | "
                     f"alive_ray_mask={alive_ray_mask.long().sum():d} | "
                     f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} |"
                 )
@@ -307,7 +333,8 @@ if __name__ == "__main__":
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'scheduler_state_dict': scheduler.state_dict(),
                                 'occupancy_grid_state_dict': occupancy_grid.state_dict(),
-                                'loss': loss
+                                'loss': color_loss,
+                                'depth_loss': depth_loss
                                 }, ckpt_path)
                     # grad_scaler <1MB, radiance_field ~48MB, optimizer ~96MB, scheduler <1MB, occupancy_grid ~592MB
                     print(f'Checkpoint save in: {ckpt_path}, {os.path.getsize(ckpt_path)/1024/1024:.2f}MB')
