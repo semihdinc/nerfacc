@@ -190,16 +190,11 @@ class SubjectTestPoseLoader(torch.utils.data.Dataset):
 
    def get_nadir_rays(self, c2w):
 
-      
-
       y = torch.tensor([self.aabb[0][1], self.aabb[1][1]], device=self.camtoworlds.device)
       x = y * (self.WIDTH/self.HEIGHT)
 
       xs = torch.linspace(x[0], x[1], steps=self.WIDTH, device=self.camtoworlds.device)
       ys = torch.linspace(-y[0], -y[1], steps=self.HEIGHT, device=self.camtoworlds.device)
-
-      # xs = torch.linspace(-self.WIDTH/2, self.WIDTH/2, steps=self.WIDTH, device=self.camtoworlds.device)
-      # ys = torch.linspace(self.HEIGHT/2, -self.HEIGHT/2, steps=self.HEIGHT, device=self.camtoworlds.device)
 
       x, y = torch.meshgrid(xs, ys, indexing="xy")
       x = x.flatten()
